@@ -342,6 +342,9 @@ where
         Ok(())
     }
 
+    fn minter_addr() -> Option<&'static MsgAddressInt> {
+        Some(&MINTER_ADDRESS)
+    }
     
     fn prepare_messages_from_transaction(
         transaction: &Transaction,
@@ -354,7 +357,7 @@ where
             let message = Message::construct_from_cell(message_cell.clone())?;
             let message_id = message_cell.repr_hash();
             let mut doc = 
-                if message.is_inbound_external() || message.src_ref() == Some(&MINTER_ADDRESS) {
+                if message.is_inbound_external() || message.src_ref() == Self::minter_addr() {
                     Self::prepare_message_json(
                         message_cell,
                         message,
