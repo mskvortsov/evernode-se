@@ -13,7 +13,7 @@
 
 use crate::{
     ActionPhaseResult, blockchain_config::{BlockchainConfig, CalcMsgFwdFees}, error::ExecutorError,
-    ExecuteParams, TransactionExecutor, VERSION_BLOCK_REVERT_MESSAGES_WITH_ANYCAST_ADDRESSES
+    ExecuteParams, TransactionExecutor, VERSION_BLOCK_REVERT_MESSAGES_WITH_ANYCAST_ADDRESSES, TransactionStack
 };
 #[cfg(feature = "timings")]
 use std::sync::atomic::AtomicU64;
@@ -24,11 +24,8 @@ use ton_block::{
     AccStatusChange, Account, AccountStatus, AddSub, CommonMsgInfo, Grams, Message, Serializable,
     TrBouncePhase, TrComputePhase, Transaction, TransactionDescr, TransactionDescrOrdinary, MASTERCHAIN_ID
 };
-use ton_types::{error, fail, Result, HashmapType, SliceData};
-use ton_vm::{
-    boolean, int,
-    stack::{integer::IntegerData, Stack, StackItem}, SmartContractInfo,
-};
+use ton_types::{error, fail, Result, HashmapType, Cell, SliceData};
+use ton_vm::SmartContractInfo;
 
 
 
@@ -57,6 +54,15 @@ impl OrdinaryTransactionExecutor {
     pub fn timing(&self, kind: usize) -> u64 {
         self.timings[kind].load(Ordering::Relaxed)
     }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct OrdinaryTransactionStack {
+    pub acc_balance: u128,
+    pub msg_balance: u128,
+    pub in_msg_cell: Cell,
+    pub in_msg_body: SliceData,
+    pub is_ext_msg: bool,
 }
 
 impl TransactionExecutor for OrdinaryTransactionExecutor {
@@ -226,13 +232,13 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             ..Default::default()
         };
         smc_info.calc_rand_seed(params.seed_block.clone(), &account_address.address().get_bytestring(0));
-        let mut stack = Stack::new();
-        stack
-            .push(int!(acc_balance.grams.as_u128()))
-            .push(int!(msg_balance.grams.as_u128()))
-            .push(StackItem::Cell(in_msg_cell))
-            .push(StackItem::Slice(in_msg.body().unwrap_or_default()))
-            .push(boolean!(is_ext_msg));
+        let stack = OrdinaryTransactionStack {
+            acc_balance: acc_balance.grams.as_u128(),
+            msg_balance: msg_balance.grams.as_u128(),
+            in_msg_cell,
+            in_msg_body: in_msg.body().unwrap_or_default(),
+            is_ext_msg,
+        };
         log::debug!(target: "executor", "compute_phase");
         let (compute_ph, actions, new_data) = match self.compute_phase(
             Some(in_msg),
@@ -240,7 +246,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             &mut acc_balance,
             &msg_balance,
             smc_info,
-            stack,
+            TransactionStack::Ordinary(stack),
             storage_fee,
             is_masterchain,
             is_special,
@@ -390,23 +396,18 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
     }
     fn ordinary_transaction(&self) -> bool { true }
     fn config(&self) -> &BlockchainConfig { &self.config }
-    fn build_stack(&self, in_msg: Option<&Message>, account: &Account) -> Stack {
-        let mut stack = Stack::new();
-        let in_msg = match in_msg {
-            Some(in_msg) => in_msg,
-            None => return stack
-        };
-        let acc_balance = int!(account.balance().map_or(0, |value| value.grams.as_u128()));
-        let msg_balance = int!(in_msg.get_value().map_or(0, |value| value.grams.as_u128()));
-        let function_selector = boolean!(in_msg.is_inbound_external());
-        let body_slice = in_msg.body().unwrap_or_default();
-        let in_msg_cell = in_msg.serialize().unwrap_or_default();
-        stack
-            .push(acc_balance)
-            .push(msg_balance)
-            .push(StackItem::Cell(in_msg_cell))
-            .push(StackItem::Slice(body_slice))
-            .push(function_selector);
-        stack
+    fn make_stack(&self, in_msg: Option<&Message>, account: &Account) -> TransactionStack {
+        match in_msg {
+            Some(in_msg) => {
+                TransactionStack::Ordinary(OrdinaryTransactionStack {
+                    acc_balance: account.balance().map_or(0, |value| value.grams.as_u128()),
+                    msg_balance: in_msg.get_value().map_or(0, |value| value.grams.as_u128()),
+                    in_msg_cell: in_msg.serialize().unwrap_or_default(),
+                    in_msg_body: in_msg.body().unwrap_or_default(),
+                    is_ext_msg: in_msg.is_inbound_external(),
+                })
+            }
+            None => TransactionStack::Uninit
+        }
     }
 }

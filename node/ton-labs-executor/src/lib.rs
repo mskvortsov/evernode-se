@@ -32,4 +32,7 @@ pub use vmsetup::*;
 pub mod blockchain_config;
 pub use blockchain_config::*;
 
+pub mod wasm;
+pub use wasm::*;
+
 include!("../common/src/info.rs");

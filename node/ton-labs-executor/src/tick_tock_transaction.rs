@@ -11,18 +11,15 @@
 * limitations under the License.
 */
 
-use crate::{blockchain_config::BlockchainConfig, ExecuteParams, TransactionExecutor, error::ExecutorError, ActionPhaseResult};
+use crate::{blockchain_config::BlockchainConfig, ExecuteParams, TransactionExecutor, error::ExecutorError, ActionPhaseResult, TransactionStack};
 
 use std::sync::atomic::Ordering;
 use ton_block::{
     Account, CurrencyCollection, Grams, Message, TrComputePhase, Transaction, 
     TransactionDescr, TransactionDescrTickTock, TransactionTickTock, Serializable
 };
-use ton_types::{error, fail, Result, HashmapType, SliceData};
-use ton_vm::{
-    boolean, int,
-    stack::{integer::IntegerData, Stack, StackItem}, SmartContractInfo,
-};
+use ton_types::{error, fail, Result, HashmapType, SliceData, UInt256};
+use ton_vm::SmartContractInfo;
 
 pub struct TickTockTransactionExecutor {
     pub config: BlockchainConfig,
@@ -36,6 +33,13 @@ impl TickTockTransactionExecutor {
             tt,
         }
     }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct TickTockTransactionStack {
+    pub acc_balance: u128,
+    pub account_id: UInt256,
+    pub is_tock: bool,
 }
 
 impl TransactionExecutor for TickTockTransactionExecutor {
@@ -121,12 +125,11 @@ impl TransactionExecutor for TickTockTransactionExecutor {
             ..Default::default()
         };
         smc_info.calc_rand_seed(params.seed_block.clone(), &account_address.address().get_bytestring(0));
-        let mut stack = Stack::new();
-        stack
-            .push(int!(account.balance().map_or(0, |value| value.grams.as_u128())))
-            .push(StackItem::integer(IntegerData::from_unsigned_bytes_be(&account_id.get_bytestring(0))))
-            .push(boolean!(self.tt.is_tock()))
-            .push(int!(-2));
+        let stack = TickTockTransactionStack {
+            acc_balance: account.balance().map_or(0, |value| value.grams.as_u128()),
+            account_id: UInt256::from_slice(&account_id.get_bytestring(0)),
+            is_tock: self.tt.is_tock(),
+        };
         log::debug!(target: "executor", "compute_phase {}", lt);
         let (compute_ph, actions, new_data) = match self.compute_phase(
             None, 
@@ -134,7 +137,7 @@ impl TransactionExecutor for TickTockTransactionExecutor {
             &mut acc_balance,
             &CurrencyCollection::default(),
             smc_info,
-            stack,
+            TransactionStack::TickTock(stack),
             storage_fee,
             is_masterchain,
             is_special,
@@ -221,16 +224,14 @@ impl TransactionExecutor for TickTockTransactionExecutor {
     }
     fn ordinary_transaction(&self) -> bool { false }
     fn config(&self) -> &BlockchainConfig { &self.config }
-    fn build_stack(&self, _in_msg: Option<&Message>, account: &Account) -> Stack {
-        let account_balance = account.balance().unwrap().grams.as_u128();
+    fn make_stack(&self, _in_msg: Option<&Message>, account: &Account) -> TransactionStack {
+        let acc_balance = account.balance().unwrap().grams.as_u128();
         let account_id = account.get_id().unwrap();
-        let mut stack = Stack::new();
-        stack
-            .push(int!(account_balance))
-            .push(StackItem::integer(IntegerData::from_unsigned_bytes_be(&account_id.get_bytestring(0))))
-            .push(boolean!(self.tt.is_tock()))
-            .push(int!(-2));
-        stack
+        TransactionStack::TickTock(TickTockTransactionStack {
+            acc_balance,
+            account_id: UInt256::from_slice(&account_id.get_bytestring(0)),
+            is_tock: self.tt.is_tock(),
+        })
     }
 }
 

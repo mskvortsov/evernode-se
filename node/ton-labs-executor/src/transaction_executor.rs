@@ -17,6 +17,8 @@ use crate::{
     error::ExecutorError,
     vmsetup::VMSetup,
     VERSION_BLOCK_NEW_CALCULATION_BOUNCED_STORAGE,
+    ordinary_transaction::OrdinaryTransactionStack,
+    tick_tock_transaction::TickTockTransactionStack,
 };
 use std::collections::LinkedList;
 
@@ -43,10 +45,11 @@ use ton_types::{
 };
 use ton_vm::executor::BehaviorModifiers;
 use ton_vm::{
+    int, boolean,
     error::tvm_exception,
     executor::{gas::gas_state::Gas, IndexProvider},
     smart_contract_info::SmartContractInfo,
-    stack::{Stack, StackItem},
+    stack::{Stack, StackItem, integer::IntegerData},
 };
 
 const RESULT_CODE_ACTIONLIST_INVALID:            i32 = 32;
@@ -75,6 +78,40 @@ pub enum IncorrectCheckRewrite {
 
 
 
+
+#[derive(Debug, PartialEq)]
+pub enum TransactionStack {
+    Ordinary(OrdinaryTransactionStack),
+    TickTock(TickTockTransactionStack),
+    Uninit,
+}
+
+impl TransactionStack {
+    pub fn build(&self) -> Stack {
+        match self {
+            TransactionStack::Ordinary(s) => {
+                let mut stack = Stack::new();
+                stack
+                    .push(int!(s.acc_balance))
+                    .push(int!(s.msg_balance))
+                    .push(StackItem::Cell(s.in_msg_cell.clone()))
+                    .push(StackItem::Slice(s.in_msg_body.clone()))
+                    .push(boolean!(s.is_ext_msg));
+                stack
+            }
+            TransactionStack::TickTock(s) => {
+                let mut stack = Stack::new();
+                stack
+                    .push(int!(s.acc_balance))
+                    .push(StackItem::integer(IntegerData::from_unsigned_bytes_be(s.account_id.as_array())))
+                    .push(boolean!(s.is_tock))
+                    .push(int!(-2));
+                stack        
+            }
+            Self::Uninit => unreachable!()
+        }
+    }
+}
 
 pub struct ExecuteParams {
     pub state_libs: HashmapE,
@@ -185,7 +222,7 @@ pub trait TransactionExecutor {
     fn ordinary_transaction(&self) -> bool;
     fn config(&self) -> &BlockchainConfig;
 
-    fn build_stack(&self, in_msg: Option<&Message>, account: &Account) -> Stack;
+    fn make_stack(&self, in_msg: Option<&Message>, account: &Account) -> TransactionStack;
 
     /// Implementation of transaction's storage phase.
     /// If account does not exist - phase skipped.
@@ -319,7 +356,7 @@ pub trait TransactionExecutor {
         acc_balance: &mut CurrencyCollection,
         msg_balance: &CurrencyCollection,
         mut smc_info: SmartContractInfo,
-        stack: Stack,
+        stack: TransactionStack,
         storage_fee: u128,
         is_masterchain: bool,
         is_special: bool,
@@ -411,14 +448,14 @@ pub trait TransactionExecutor {
             smc_info.set_init_code_hash(init_code_hash.clone());
         }
         let mut vm = VMSetup::with_capabilites(SliceData::load_cell(code)?, self.config().capabilites())
-            .set_smart_contract_info(smc_info)?
+            .set_smart_contract_info(smc_info)
             .set_stack(stack)
-            .set_data(data)?
+            .set_data(data)
             .set_libraries(libs)
             .set_gas(gas)
             .set_debug(params.debug)
-            .create();
-        
+            .create()?;
+
         if let Some(modifiers) = params.behavior_modifiers.clone() {
             vm.modify_behavior(modifiers);
         }
@@ -426,7 +463,7 @@ pub trait TransactionExecutor {
         //TODO: set vm_init_state_hash
 
         if let Some(trace_callback) = params.trace_callback.clone() {
-            vm.set_trace_callback(move |engine, info| trace_callback(engine, info));
+            vm.set_trace_callback(Box::new(move |engine, info| trace_callback(engine, info)));
         }
 
         let result = vm.execute();
@@ -489,7 +526,7 @@ pub trait TransactionExecutor {
         }
 
         let new_data = if let StackItem::Cell(cell) = vm.get_committed_state().get_root() {
-            Some(cell)
+            Some(cell.clone())
         } else {
             log::debug!(target: "executor", "invalid contract, it must be cell in c4 register");
             vm_phase.success = false;
@@ -497,7 +534,7 @@ pub trait TransactionExecutor {
         };
 
         let out_actions = if let StackItem::Cell(root_cell) = vm.get_committed_state().get_actions() {
-            Some(root_cell)
+            Some(root_cell.clone())
         } else {
             log::debug!(target: "executor", "invalid contract, it must be cell in c5 register");
             vm_phase.success = false;
