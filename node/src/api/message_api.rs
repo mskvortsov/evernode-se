@@ -26,6 +26,7 @@ use router::Router;
 use serde_json::Value;
 use std::{
     io::{Cursor, Read},
+    str::FromStr,
     sync::Arc,
     thread,
     time::Duration,
