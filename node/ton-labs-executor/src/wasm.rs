@@ -52,13 +52,13 @@ impl<'a> Cursor<'a> {
     }
     fn read_u8(&mut self) -> Result<u8> {
         let bytes = &self.bytes[self.pos..self.pos + 1];
-        let byte = u8::from_be_bytes(bytes.try_into()?);
+        let byte = u8::from_le_bytes(bytes.try_into()?);
         self.pos += 1;
         Ok(byte)
     }
     fn read_u32(&mut self) -> Result<u32> {
         let bytes = &self.bytes[self.pos..self.pos + 4];
-        let v = u32::from_be_bytes(bytes.try_into()?);
+        let v = u32::from_le_bytes(bytes.try_into()?);
         self.pos += 4;
         Ok(v)
     }
@@ -157,7 +157,7 @@ impl WasmVM {
     fn serialize_hashmap(&mut self, h: HashmapE) -> Result<Vec<u8>> {
         let mut bytes = vec!();
         let bits = h.bit_len() as u32;
-        bytes.append(&mut Vec::from(bits.to_be_bytes()));
+        bytes.append(&mut Vec::from(bits.to_le_bytes()));
         if let Some(cell) = h.data() {
             bytes.push(0x01);
             bytes.append(&mut self.serialize_cell(cell.clone())?);
@@ -172,7 +172,7 @@ impl WasmVM {
         let hostid = cell_register(cell_registry, &c);
         let mut cell_bytes = cell_serialize(&c, hostid)?;
         let size = u32::try_from(cell_bytes.len())?;
-        bytes.append(&mut Vec::from(size.to_be_bytes()));
+        bytes.append(&mut Vec::from(size.to_le_bytes()));
         bytes.append(&mut cell_bytes);
         Ok(bytes)
     }
@@ -182,8 +182,8 @@ impl WasmVM {
         let data_end = s.remaining_bits() as u16 + data_start;
         let refs_start = s.get_references().start as u8;
         let refs_end = s.get_references().end as u8;
-        bytes.append(&mut Vec::from(data_start.to_be_bytes()));
-        bytes.append(&mut Vec::from(data_end.to_be_bytes()));
+        bytes.append(&mut Vec::from(data_start.to_le_bytes()));
+        bytes.append(&mut Vec::from(data_end.to_le_bytes()));
         bytes.push(refs_start);
         bytes.push(refs_end);
         bytes.append(&mut self.serialize_cell(s.cell().clone())?);
@@ -205,26 +205,26 @@ impl WasmVM {
         }
         { // params
             let mut bytes = vec!();
-            bytes.append(&mut Vec::from(self.sci.actions.to_be_bytes()));
-            bytes.append(&mut Vec::from(self.sci.msgs_sent.to_be_bytes()));
-            bytes.append(&mut Vec::from(self.sci.unix_time.to_be_bytes()));
-            bytes.append(&mut Vec::from(self.sci.block_lt.to_be_bytes()));
-            bytes.append(&mut Vec::from(self.sci.trans_lt.to_be_bytes()));
-            bytes.append(&mut Vec::from(self.sci.seq_no.to_be_bytes()));
+            bytes.append(&mut Vec::from(self.sci.actions.to_le_bytes()));
+            bytes.append(&mut Vec::from(self.sci.msgs_sent.to_le_bytes()));
+            bytes.append(&mut Vec::from(self.sci.unix_time.to_le_bytes()));
+            bytes.append(&mut Vec::from(self.sci.block_lt.to_le_bytes()));
+            bytes.append(&mut Vec::from(self.sci.trans_lt.to_le_bytes()));
+            bytes.append(&mut Vec::from(self.sci.seq_no.to_le_bytes()));
             let mut rand_seed = Self::serialize_rand_seed(&self.sci.rand_seed)?;
             bytes.append(&mut rand_seed);
-            bytes.append(&mut Vec::from(self.sci.balance.grams.as_u128().to_be_bytes()));
+            bytes.append(&mut Vec::from(self.sci.balance.grams.as_u128().to_le_bytes()));
             let balance_other = HashmapE::with_hashmap(32, self.sci.balance.other.root().cloned());
             bytes.append(&mut self.serialize_hashmap(balance_other)?);
-            bytes.append(&mut Vec::from(self.sci.balance_remaining_grams.to_be_bytes()));
+            bytes.append(&mut Vec::from(self.sci.balance_remaining_grams.to_le_bytes()));
             bytes.append(&mut self.serialize_hashmap(self.sci.balance_remaining_other.clone())?);
             bytes.append(&mut self.serialize_slice(self.sci.myself.clone())?);
             let config_params = self.sci.config_params.clone().unwrap_or_default();
             bytes.append(&mut self.serialize_cell(config_params)?);
             bytes.append(&mut self.serialize_cell(self.sci.mycode.clone())?);
             bytes.append(&mut self.sci.init_code_hash.as_array().to_vec());
-            bytes.append(&mut Vec::from(self.sci.storage_fee_collected.to_be_bytes()));
-            bytes.append(&mut Vec::from(self.sci.capabilities.to_be_bytes()));
+            bytes.append(&mut Vec::from(self.sci.storage_fee_collected.to_le_bytes()));
+            bytes.append(&mut Vec::from(self.sci.capabilities.to_le_bytes()));
             res.append(&mut bytes);
         }
         { // txn
@@ -232,15 +232,15 @@ impl WasmVM {
             match self.stack.clone() {
                 TransactionStack::Ordinary(t) => {
                     bytes.push(0x01);
-                    bytes.append(&mut Vec::from(t.acc_balance.to_be_bytes()));
-                    bytes.append(&mut Vec::from(t.msg_balance.to_be_bytes()));
+                    bytes.append(&mut Vec::from(t.acc_balance.to_le_bytes()));
+                    bytes.append(&mut Vec::from(t.msg_balance.to_le_bytes()));
                     bytes.append(&mut self.serialize_cell(t.in_msg_cell)?);
                     bytes.append(&mut self.serialize_slice(t.in_msg_body)?);
                     bytes.push(u8::from(t.is_ext_msg));
                 }
                 TransactionStack::TickTock(t) => {
                     bytes.push(0x00);
-                    bytes.append(&mut Vec::from(t.acc_balance.to_be_bytes()));
+                    bytes.append(&mut Vec::from(t.acc_balance.to_le_bytes()));
                     bytes.append(&mut t.account_id.as_array().to_vec());
                     bytes.push(u8::from(t.is_tock));
                 }
@@ -348,7 +348,7 @@ fn load_cell_ref_impl(mut env: FunctionEnvMut<WasmEnv>, hostid: u32, index: u32)
     let offset = alloc.call(&mut env, size + 4)?;
     let memory = env.data().memory();
     let view = memory.view(&env);
-    view.write(offset as u64, &size.to_be_bytes())?;
+    view.write(offset as u64, &size.to_le_bytes())?;
     view.write(offset as u64 + 4, &bytes)?;
 
     Ok(offset)
@@ -362,8 +362,8 @@ fn cell_serialize(cell: &Cell, hostid: usize) -> Result<Vec<u8>> {
     let references_count = u8::try_from(cell.references_count())?;
 
     let mut bytes = vec!();
-    bytes.append(&mut Vec::from(hostid.to_be_bytes()));
-    bytes.append(&mut Vec::from(cell_data_size.to_be_bytes()));
+    bytes.append(&mut Vec::from(hostid.to_le_bytes()));
+    bytes.append(&mut Vec::from(cell_data_size.to_le_bytes()));
     bytes.append(&mut cell_data_bytes);
     bytes.push(references_count);
 
