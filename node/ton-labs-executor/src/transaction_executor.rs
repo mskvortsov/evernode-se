@@ -79,7 +79,7 @@ pub enum IncorrectCheckRewrite {
 
 
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransactionStack {
     Ordinary(OrdinaryTransactionStack),
     TickTock(TickTockTransactionStack),
@@ -526,7 +526,7 @@ pub trait TransactionExecutor {
         }
 
         let new_data = if let StackItem::Cell(cell) = vm.get_committed_state().get_root() {
-            Some(cell.clone())
+            Some(cell)
         } else {
             log::debug!(target: "executor", "invalid contract, it must be cell in c4 register");
             vm_phase.success = false;
@@ -534,7 +534,7 @@ pub trait TransactionExecutor {
         };
 
         let out_actions = if let StackItem::Cell(root_cell) = vm.get_committed_state().get_actions() {
-            Some(root_cell.clone())
+            Some(root_cell)
         } else {
             log::debug!(target: "executor", "invalid contract, it must be cell in c5 register");
             vm_phase.success = false;

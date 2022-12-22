@@ -18,15 +18,15 @@ use ed25519_dalek::{PublicKey, Verifier};
 
 use ton_types::{
     Result, SliceData, HashmapE, Cell, HashmapType, ExceptionCode,
-    serialize_tree_of_cells, deserialize_tree_of_cells
+    deserialize_tree_of_cells,
 };
 use ton_vm::{
     executor::{CommittedState, BehaviorModifiers, Engine, EngineTraceInfo, gas::gas_state::Gas},
     SmartContractInfo, stack::{StackItem, integer::IntegerData},
 };
 use wasmer::{
-    imports, Store, Module, Instance, Value, WasmPtr,
-    Function, wasmparser::Operator, CompilerConfig, EngineBuilder, Imports, FunctionEnvMut, FunctionEnv, FunctionType, Type, Memory
+    CompilerConfig, EngineBuilder, Function, FunctionEnv, FunctionEnvMut, Imports, imports, Instance,
+    Memory, Module, Store, TypedFunction, WasmPtr, wasmparser::Operator,
 };
 use wasmer_compiler_singlepass::Singlepass;
 use wasmer_middlewares::{
@@ -48,7 +48,7 @@ impl<'a> Cursor<'a> {
         }
     }
     fn read_bool(&mut self) -> Result<bool> {
-        self.read_u8().and_then(|v| Ok(v != 0))
+        self.read_u8().map(|v| v != 0)
     }
     fn read_u8(&mut self) -> Result<u8> {
         let bytes = &self.bytes[self.pos..self.pos + 1];
@@ -72,7 +72,9 @@ impl<'a> Cursor<'a> {
 
 struct WasmEnv {
     memory: Option<Memory>,
+    alloc: Option<TypedFunction<u32, u32>>,
     accepted: Arc<Mutex<bool>>,
+    cell_registry: Vec<Cell>,
 }
 
 impl WasmEnv {
@@ -87,9 +89,13 @@ pub struct WasmVM {
     output: CommittedState,
     exit_code: i32,
 
+    data: Cell,
+    sci: SmartContractInfo,
+    stack: TransactionStack,
+
     store: Store,
     module: Module,
-    input: Vec<u8>,
+    env: FunctionEnv<WasmEnv>,
 }
 
 impl WasmVM {
@@ -106,25 +112,36 @@ impl WasmVM {
         };
 
         let bytecode = Self::make_bytecode(code)?;
-        let input = Self::make_input(data, sci.unwrap_or_default(), stack)?;
-        log::debug!(target: "executor", "wasm bytecode {}, input {}", bytecode.len(), input.len());
 
         let cost_function = |_: &Operator| -> u64 { 1 };
         let metering = Arc::new(Metering::new(0, cost_function));
         let mut compiler_config = Singlepass::default();
         compiler_config.push_middleware(metering);
 
-        let store = Store::new(EngineBuilder::new(compiler_config));
+        let mut store = Store::new(EngineBuilder::new(compiler_config));
         let module = Module::from_binary(&store, &bytecode)?;
+
+        let env = FunctionEnv::new(
+            &mut store,
+            WasmEnv {
+                memory: None,
+                alloc: None,
+                accepted: Arc::new(Mutex::new(false)),
+                cell_registry: vec!(),
+            }
+        );
 
         Ok(Self {
             is_ext_msg,
             gas: gas.unwrap_or(Gas::empty()),
             output: CommittedState::new_empty(),
             exit_code: 0,
+            data,
+            sci: sci.unwrap_or_default(),
+            stack,
             store,
             module,
-            input,
+            env,
         })
     }
     fn make_bytecode(code: SliceData) -> Result<Vec<u8>> {
@@ -137,31 +154,29 @@ impl WasmVM {
         }
         Ok(bytecode)
     }
-    fn serialize_hashmap(h: &HashmapE) -> Result<Vec<u8>> {
+    fn serialize_hashmap(&mut self, h: HashmapE) -> Result<Vec<u8>> {
         let mut bytes = vec!();
         let bits = h.bit_len() as u32;
         bytes.append(&mut Vec::from(bits.to_be_bytes()));
         if let Some(cell) = h.data() {
             bytes.push(0x01);
-            bytes.append(&mut Self::serialize_cell(cell)?);
+            bytes.append(&mut self.serialize_cell(cell.clone())?);
         } else {
             bytes.push(0x00);
         }
         Ok(bytes)
     }
-    fn serialize_cell(c: &Cell) -> Result<Vec<u8>> {
-        let mut b = vec!();
-        serialize_tree_of_cells(&c, &mut b)?;
-        Ok(b)
+    fn serialize_cell(&mut self, c: Cell) -> Result<Vec<u8>> {
+        let mut bytes = vec!();
+        let cell_registry = &mut self.env.as_mut(&mut self.store).cell_registry;
+        let hostid = cell_register(cell_registry, &c);
+        let mut cell_bytes = cell_serialize(&c, hostid)?;
+        let size = u32::try_from(cell_bytes.len())?;
+        bytes.append(&mut Vec::from(size.to_be_bytes()));
+        bytes.append(&mut cell_bytes);
+        Ok(bytes)
     }
-    fn serialize_lazy_cell(c: &Cell) -> Result<Vec<u8>> {
-        let mut bytes = Self::serialize_cell(c)?;
-        let mut b = vec!();
-        b.append(&mut Vec::from((bytes.len() as u32).to_be_bytes()));
-        b.append(&mut bytes);
-        Ok(b)
-    }
-    fn serialize_slice(s: &SliceData) -> Result<Vec<u8>> {
+    fn serialize_slice(&mut self, s: SliceData) -> Result<Vec<u8>> {
         let mut bytes = vec!();
         let data_start = s.pos() as u16;
         let data_end = s.remaining_bits() as u16 + data_start;
@@ -171,64 +186,63 @@ impl WasmVM {
         bytes.append(&mut Vec::from(data_end.to_be_bytes()));
         bytes.push(refs_start);
         bytes.push(refs_end);
-        bytes.append(&mut Self::serialize_cell(s.cell())?);
+        bytes.append(&mut self.serialize_cell(s.cell().clone())?);
         Ok(bytes)
     }
     fn serialize_rand_seed(rand_seed: &IntegerData) -> Result<Vec<u8>> {
-        Ok(rand_seed.take_value_of(|v| {
+        rand_seed.take_value_of(|v| {
             let (_sign, mut biguint) = v.to_bytes_be();
             // TODO check sign is Plus
             let mut bytes = vec!(0x00; 32 - biguint.len());
             bytes.append(&mut biguint);
             Some(bytes)
-        })?)
+        })
     }
-    fn make_input(data: Cell, sci: SmartContractInfo, stack: TransactionStack) -> Result<Vec<u8>> {
+    fn make_input(&mut self) -> Result<Vec<u8>> {
         let mut res = vec!();
         { // storage
-            let mut bytes = vec!();
-            serialize_tree_of_cells(&data, &mut bytes).unwrap();
-            res.append(&mut bytes);
+            res.append(&mut self.serialize_cell(self.data.clone())?);
         }
         { // params
             let mut bytes = vec!();
-            bytes.append(&mut Vec::from(sci.actions.to_be_bytes()));
-            bytes.append(&mut Vec::from(sci.msgs_sent.to_be_bytes()));
-            bytes.append(&mut Vec::from(sci.unix_time.to_be_bytes()));
-            bytes.append(&mut Vec::from(sci.block_lt.to_be_bytes()));
-            bytes.append(&mut Vec::from(sci.trans_lt.to_be_bytes()));
-            bytes.append(&mut Vec::from(sci.seq_no.to_be_bytes()));
-            let mut rand_seed = Self::serialize_rand_seed(&sci.rand_seed)?;
+            bytes.append(&mut Vec::from(self.sci.actions.to_be_bytes()));
+            bytes.append(&mut Vec::from(self.sci.msgs_sent.to_be_bytes()));
+            bytes.append(&mut Vec::from(self.sci.unix_time.to_be_bytes()));
+            bytes.append(&mut Vec::from(self.sci.block_lt.to_be_bytes()));
+            bytes.append(&mut Vec::from(self.sci.trans_lt.to_be_bytes()));
+            bytes.append(&mut Vec::from(self.sci.seq_no.to_be_bytes()));
+            let mut rand_seed = Self::serialize_rand_seed(&self.sci.rand_seed)?;
             bytes.append(&mut rand_seed);
-            bytes.append(&mut Vec::from(sci.balance.grams.as_u128().to_be_bytes()));
-            let balance_other = HashmapE::with_hashmap(32, sci.balance.other.root().cloned());
-            bytes.append(&mut Self::serialize_hashmap(&balance_other)?);
-            bytes.append(&mut Vec::from(sci.balance_remaining_grams.to_be_bytes()));
-            bytes.append(&mut Self::serialize_hashmap(&sci.balance_remaining_other)?);
-            bytes.append(&mut Self::serialize_slice(&sci.myself)?);
-            bytes.append(&mut Self::serialize_lazy_cell(sci.config_params.as_ref().unwrap_or(&Cell::default()))?);
-            bytes.append(&mut Self::serialize_lazy_cell(&sci.mycode)?);
-            bytes.append(&mut sci.init_code_hash.as_array().to_vec());
-            bytes.append(&mut Vec::from(sci.storage_fee_collected.to_be_bytes()));
-            bytes.append(&mut Vec::from(sci.capabilities.to_be_bytes()));
+            bytes.append(&mut Vec::from(self.sci.balance.grams.as_u128().to_be_bytes()));
+            let balance_other = HashmapE::with_hashmap(32, self.sci.balance.other.root().cloned());
+            bytes.append(&mut self.serialize_hashmap(balance_other)?);
+            bytes.append(&mut Vec::from(self.sci.balance_remaining_grams.to_be_bytes()));
+            bytes.append(&mut self.serialize_hashmap(self.sci.balance_remaining_other.clone())?);
+            bytes.append(&mut self.serialize_slice(self.sci.myself.clone())?);
+            let config_params = self.sci.config_params.clone().unwrap_or_default();
+            bytes.append(&mut self.serialize_cell(config_params)?);
+            bytes.append(&mut self.serialize_cell(self.sci.mycode.clone())?);
+            bytes.append(&mut self.sci.init_code_hash.as_array().to_vec());
+            bytes.append(&mut Vec::from(self.sci.storage_fee_collected.to_be_bytes()));
+            bytes.append(&mut Vec::from(self.sci.capabilities.to_be_bytes()));
             res.append(&mut bytes);
         }
         { // txn
             let mut bytes = vec!();
-            match &stack {
+            match self.stack.clone() {
                 TransactionStack::Ordinary(t) => {
                     bytes.push(0x01);
                     bytes.append(&mut Vec::from(t.acc_balance.to_be_bytes()));
                     bytes.append(&mut Vec::from(t.msg_balance.to_be_bytes()));
-                    bytes.append(&mut Self::serialize_lazy_cell(&t.in_msg_cell)?);
-                    bytes.append(&mut Self::serialize_slice(&t.in_msg_body)?);
-                    bytes.push(if t.is_ext_msg { 0x01 } else { 0x00 });
+                    bytes.append(&mut self.serialize_cell(t.in_msg_cell)?);
+                    bytes.append(&mut self.serialize_slice(t.in_msg_body)?);
+                    bytes.push(u8::from(t.is_ext_msg));
                 }
                 TransactionStack::TickTock(t) => {
                     bytes.push(0x00);
                     bytes.append(&mut Vec::from(t.acc_balance.to_be_bytes()));
                     bytes.append(&mut t.account_id.as_array().to_vec());
-                    bytes.push(if t.is_tock { 0x01 } else { 0x00 });
+                    bytes.push(u8::from(t.is_tock));
                 }
                 TransactionStack::Uninit => {
                     unreachable!()
@@ -238,24 +252,18 @@ impl WasmVM {
         }
         Ok(res)
     }
-    fn make_imports(&mut self, function_env: &FunctionEnv<WasmEnv>) -> Imports {
-        let accept = Function::new_typed_with_env(&mut self.store, &function_env, |env: FunctionEnvMut<WasmEnv>| {
+    fn make_imports(&mut self) -> Imports {
+        let accept = Function::new_typed_with_env(&mut self.store, &self.env, |env: FunctionEnvMut<WasmEnv>| {
+            log::debug!(target: "executor", "ACCEPT");
             *env.data().accepted.lock().unwrap() = true;
         });
-        let print_signature = FunctionType::new(vec![Type::I32], vec![]);
-        let print = Function::new(&mut self.store, &print_signature, |args| {
-            println!("PRINT {:08x}", args[0].unwrap_i32());
-            Ok(vec!())
+        let print = Function::new_typed(&mut self.store, |v: u32| {
+            log::debug!(target: "executor", "PRINT {:08x}", v);
         });
-        let print3_signature = FunctionType::new(vec![Type::I32, Type::I32, Type::I32], vec![]);
-        let print3 = Function::new(&mut self.store, &print3_signature, |args| {
-            let is_alloc = args[0].unwrap_i32();
-            let ptr = args[1].unwrap_i32();
-            let size = args[2].unwrap_i32();
-            println!("{} {:08x} {}", if is_alloc == 1 { "ALLOC" } else { "DEALL" }, ptr, size);
-            Ok(vec!())
+        let trace = Function::new_typed(&mut self.store, |is_alloc: u32, ptr: u32, size: u32| {
+            log::debug!(target: "executor", "{} {:08x} {}", if is_alloc == 1 { "ALLOC" } else { "DEALL" }, ptr, size);
         });
-        let chksignu = Function::new_typed_with_env(&mut self.store, &function_env,
+        let chksignu = Function::new_typed_with_env(&mut self.store, &self.env,
             |env: FunctionEnvMut<WasmEnv>, h: u32, s: u32, k: u32| {
                 let memory = env.data().memory();
                 let view = memory.view(&env);
@@ -280,24 +288,29 @@ impl WasmVM {
                         }
                     }
                 }
-                return 1;
+                1
+            }
+        );
+        let load_cell_ref = Function::new_typed_with_env(&mut self.store, &self.env,
+            |env: FunctionEnvMut<WasmEnv>, hostid: u32, index: u32| {
+                load_cell_ref_impl(env, hostid, index).unwrap_or(0)
             }
         );
         imports! {
             "env" => {
                 "accept" => accept,
                 "print" => print,
-                "print3" => print3,
+                "trace" => trace,
                 "chksignu" => chksignu,
+                "load_cell_ref" => load_cell_ref,
             }
         }
     }
-    fn read_output(&mut self, memory: &Memory, output_ptr: Value) -> Result<()> {
+    fn read_output(&mut self, memory: &Memory, output_ptr: u32) -> Result<()> {
         let view = memory.view(&self.store);
 
-        let out_ptr = output_ptr.unwrap_i32() as u32;
-        let new_data_ptr = WasmPtr::<u32>::new(out_ptr).deref(&view).read().unwrap();
-        let new_data_size = WasmPtr::<u32>::new(out_ptr + 4).deref(&view).read().unwrap();
+        let new_data_ptr = WasmPtr::<u32>::new(output_ptr).deref(&view).read().unwrap();
+        let new_data_size = WasmPtr::<u32>::new(output_ptr + 4).deref(&view).read().unwrap();
 
         let mut output = vec!(0x00; new_data_size as usize);
         view.read(new_data_ptr as u64, &mut output)?;
@@ -319,6 +332,49 @@ impl WasmVM {
     }
 }
 
+fn load_cell_ref_impl(mut env: FunctionEnvMut<WasmEnv>, hostid: u32, index: u32) -> Result<u32> {
+    // Get child cell
+    let registry = &mut env.data_mut().cell_registry;
+    let cell = registry.get(hostid as usize).unwrap(); // TODO err
+    let child = cell.reference(index as usize)?;
+
+    // Register and serialize child cell
+    let new_hostid = cell_register(registry, &child);
+    let bytes = cell_serialize(&child, new_hostid)?;
+    let size = u32::try_from(bytes.len())?;
+
+    // Write serialized cell into guest memory
+    let alloc = env.data().alloc.as_ref().unwrap().clone();
+    let offset = alloc.call(&mut env, size + 4)?;
+    let memory = env.data().memory();
+    let view = memory.view(&env);
+    view.write(offset as u64, &size.to_be_bytes())?;
+    view.write(offset as u64 + 4, &bytes)?;
+
+    Ok(offset)
+}
+
+fn cell_serialize(cell: &Cell, hostid: usize) -> Result<Vec<u8>> {
+    let hostid = u32::try_from(hostid)?;
+    let mut cell_data_bytes = vec!();
+    cell.cell_data().serialize(&mut cell_data_bytes)?;
+    let cell_data_size = u32::try_from(cell_data_bytes.len())?;
+    let references_count = u8::try_from(cell.references_count())?;
+
+    let mut bytes = vec!();
+    bytes.append(&mut Vec::from(hostid.to_be_bytes()));
+    bytes.append(&mut Vec::from(cell_data_size.to_be_bytes()));
+    bytes.append(&mut cell_data_bytes);
+    bytes.push(references_count);
+
+    Ok(bytes)
+}
+
+fn cell_register(registry: &mut Vec<Cell>, cell: &Cell) -> usize {
+    registry.push(cell.clone());
+    registry.len() - 1
+}
+
 const GAS_FACTOR: u64 = 666;
 const GAS_FOR_ALLOC: u64 = 10000;
 
@@ -328,38 +384,31 @@ impl VM for WasmVM {
     fn set_trace_callback(&mut self, _callback: Box<dyn Fn(&Engine, &EngineTraceInfo) + Send + Sync + 'static>) {
     }
     fn execute(&mut self) -> Result<i32> {
-        let function_env = FunctionEnv::new(
-            &mut self.store,
-            WasmEnv {
-                memory: None,
-                accepted: Arc::new(Mutex::new(false)),
-            }
-        );
-        let import_object = self.make_imports(&function_env);
+        let import_object = self.make_imports();
         let instance = Instance::new(&mut self.store, &self.module, &import_object)?;
 
         // alloc(size: i32) -> *mut u8
-        let alloc = instance.exports.get_function("alloc")?;
+        let alloc = instance.exports.get_typed_function::<u32, u32>(&self.store, "alloc")?;
         // entry(output_ptr: *mut u8, input_ptr: *const u8, input_size: i32)
-        let entry = instance.exports.get_function("entry")?;
+        let entry = instance.exports.get_typed_function::<(u32, u32, u32), ()>(&self.store, "entry")?;
         // Entire guest memory
         let memory = instance.exports.get_memory("memory")?;
-        function_env.as_mut(&mut self.store).memory = Some(memory.clone());
+        self.env.as_mut(&mut self.store).memory = Some(memory.clone());
+        self.env.as_mut(&mut self.store).alloc = Some(alloc.clone());
+
+        let input = self.make_input()?;
 
         // Allocate guest memory for input data
         set_remaining_points(&mut self.store, &instance, GAS_FOR_ALLOC);
-        let input_size = Value::I32(self.input.len() as i32);
-        // TODO get rid of [0]
-        let input_ptr = alloc.call(&mut self.store, &[input_size.clone()])?.to_vec()[0].clone();
+        let input_ptr = alloc.call(&mut self.store, input.len() as u32)?;
         // Write input data starting from the offset given by the input ptr
-        let view = memory.view(&mut self.store);
-        let offset = input_ptr.i32().unwrap() as u64;
-        view.write(offset, &self.input)?;
+        let view = memory.view(&self.store);
+        view.write(input_ptr as u64, &input)?;
         // Allocate a structure of two 4-bytes fields:
         //  - output data ptr
         //  - output data size
         set_remaining_points(&mut self.store, &instance, GAS_FOR_ALLOC);
-        let output_ptr = alloc.call(&mut self.store, &[Value::I32(8)])?.to_vec()[0].clone();
+        let output_ptr = alloc.call(&mut self.store, 8)?;
 
         // Compute initial gas offering
         let remaining_gas = self.gas.get_gas_limit() + self.gas.get_gas_credit();
@@ -368,7 +417,7 @@ impl VM for WasmVM {
         set_remaining_points(&mut self.store, &instance, initial_limit);
 
         // Execute contract's entry function for the first time
-        let res = entry.call(&mut self.store, &[output_ptr.clone(), input_ptr.clone(), input_size.clone()]);
+        let res = entry.call(&mut self.store, output_ptr, input_ptr, input.len() as u32);
         match get_remaining_points(&mut self.store, &instance) {
             MeteringPoints::Remaining(rem) => {
                 log::debug!(target: "executor", "points remaining {}", rem);
@@ -381,7 +430,7 @@ impl VM for WasmVM {
                 }
             }
             MeteringPoints::Exhausted => {
-                let accepted = *function_env.as_ref(&mut self.store).accepted.lock().unwrap();
+                let accepted = *self.env.as_ref(&self.store).accepted.lock().unwrap();
                 if self.is_ext_msg && accepted {
                     // Let transaction executor know there was an accept
                     self.gas.new_gas_limit(i64::MAX);
@@ -392,7 +441,7 @@ impl VM for WasmVM {
                     set_remaining_points(&mut self.store, &instance, secondary_limit);
 
                     // Execute contract's entry point for the second time
-                    let res2 = entry.call(&mut self.store, &[output_ptr.clone(), input_ptr, input_size]);
+                    let res2 = entry.call(&mut self.store, output_ptr, input_ptr, input.len() as u32);
                     match get_remaining_points(&mut self.store, &instance) {
                         MeteringPoints::Remaining(rem) => {
                             log::debug!(target: "executor", "points remaining {}", rem);

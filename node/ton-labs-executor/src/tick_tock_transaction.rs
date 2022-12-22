@@ -35,7 +35,7 @@ impl TickTockTransactionExecutor {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TickTockTransactionStack {
     pub acc_balance: u128,
     pub account_id: UInt256,

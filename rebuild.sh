@@ -2,7 +2,7 @@
 
 docker run --name build-kit --interactive --tty \
 --mount "type=bind,source=$(pwd)/node/ton-labs-executor,target=/ton-node/ton-labs-executor" \
-build-kit /bin/bash -c "/root/.cargo/bin/cargo update; /root/.cargo/bin/cargo build --release"
+build-kit /bin/bash -c "/root/.cargo/bin/cargo build --release"
 
 docker cp build-kit:/ton-node/target/release/ton_node_startup ton-node
 docker rm build-kit

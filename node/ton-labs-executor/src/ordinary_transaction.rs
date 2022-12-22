@@ -56,7 +56,7 @@ impl OrdinaryTransactionExecutor {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrdinaryTransactionStack {
     pub acc_balance: u128,
     pub msg_balance: u128,

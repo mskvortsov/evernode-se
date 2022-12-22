@@ -20,16 +20,18 @@ use crate::{wasm::WasmVM, TransactionStack};
 
 use ton_vm::executor::CommittedState;
 
+type TraceCallback = dyn Fn(&Engine, &EngineTraceInfo) + Send + Sync + 'static;
+
 pub trait VM {
     fn modify_behavior(&mut self, modifiers: BehaviorModifiers);
-    fn set_trace_callback(&mut self, callback: Box<dyn Fn(&Engine, &EngineTraceInfo) + Send + Sync + 'static>);
+    fn set_trace_callback(&mut self, callback: Box<TraceCallback>);
     fn execute(&mut self) -> Result<i32>;
     fn steps(&self) -> u32;
     fn get_committed_state(&self) -> &CommittedState;
     fn get_gas(&self) -> &Gas;
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq)]
 pub enum VMKind {
     TVM,
     WasmVM
@@ -49,10 +51,11 @@ pub struct VMSetup {
     debug: bool,
 }
 
-struct TVM {
+struct Tvm {
     vm: Engine
 }
-impl VM for TVM {
+
+impl VM for Tvm {
     fn modify_behavior(&mut self, modifiers: BehaviorModifiers) {
         self.vm.modify_behavior(modifiers)
     }
@@ -79,7 +82,7 @@ impl VMSetup {
     /// Initializes some registers of TVM with predefined values.
     pub fn with_capabilites(code: SliceData, capabilities: u64) -> Self {
         let bytes = code.get_bytestring(0);
-        let kind = if bytes == &[0xff, 0xee] {
+        let kind = if bytes == [0xff, 0xee] {
             log::debug!(target: "executor", "wasm bytecode detected");
             VMKind::WasmVM
         } else {
@@ -171,7 +174,7 @@ impl VMSetup {
             let mut sci = sci.into_temp_data_item();
             ctrls.put(7, &mut sci)?;
         }
-        Ok(Box::new(TVM { vm: vm.setup_with_libraries(
+        Ok(Box::new(Tvm { vm: vm.setup_with_libraries(
             self.code,
             Some(ctrls),
             Some(self.stack.build()),
