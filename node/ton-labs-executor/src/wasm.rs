@@ -18,7 +18,7 @@ use ed25519_dalek::{PublicKey, Verifier};
 
 use ton_types::{
     Result, SliceData, HashmapE, Cell, HashmapType, ExceptionCode,
-    deserialize_tree_of_cells,
+    CellType, DataCell, error,
 };
 use ton_vm::{
     executor::{CommittedState, BehaviorModifiers, Engine, EngineTraceInfo, gas::gas_state::Gas},
@@ -56,17 +56,22 @@ impl<'a> Cursor<'a> {
         self.pos += 1;
         Ok(byte)
     }
+    fn read_u16(&mut self) -> Result<u16> {
+        let bytes = &self.bytes[self.pos..self.pos + 2];
+        let v = u16::from_le_bytes(bytes.try_into()?);
+        self.pos += 2;
+        Ok(v)
+    }
     fn read_u32(&mut self) -> Result<u32> {
         let bytes = &self.bytes[self.pos..self.pos + 4];
         let v = u32::from_le_bytes(bytes.try_into()?);
         self.pos += 4;
         Ok(v)
     }
-    fn read_cell(&mut self) -> Result<Cell> {
-        let mut cur = std::io::Cursor::new(&self.bytes[self.pos..]);
-        let v = deserialize_tree_of_cells(&mut cur)?;
-        self.pos += cur.position() as usize;
-        Ok(v)
+    fn read_bytestring(&mut self, size: usize) -> Result<Vec<u8>> {
+        let bytes = &self.bytes[self.pos..self.pos + size];
+        self.pos += size;
+        Ok(Vec::from(bytes))
     }
 }
 
@@ -127,7 +132,7 @@ impl WasmVM {
                 memory: None,
                 alloc: None,
                 accepted: Arc::new(Mutex::new(false)),
-                cell_registry: vec!(),
+                cell_registry: vec!(Cell::default()),
             }
         );
 
@@ -296,6 +301,11 @@ impl WasmVM {
                 load_cell_ref_impl(env, hostid, index).unwrap_or(0)
             }
         );
+        let make_cell = Function::new_typed_with_env(&mut self.store, &self.env,
+            |env: FunctionEnvMut<WasmEnv>, ptr: u32, size: u32| {
+                make_cell_impl(env, ptr, size).unwrap_or(0)
+            }
+        );
         imports! {
             "env" => {
                 "accept" => accept,
@@ -303,6 +313,7 @@ impl WasmVM {
                 "trace" => trace,
                 "chksignu" => chksignu,
                 "load_cell_ref" => load_cell_ref,
+                "make_cell" => make_cell,
             }
         }
     }
@@ -318,8 +329,11 @@ impl WasmVM {
         let mut c = Cursor::new(&output);
         self.exit_code = c.read_u32()? as i32;
         let is_committed = c.read_bool()?;
-        let storage = c.read_cell()?;
-        let actions = c.read_cell()?;
+        let storage_hostid = c.read_u32()? as usize;
+        let actions_hostid = c.read_u32()? as usize;
+        let cell_registry = &self.env.as_ref(&self.store).cell_registry;
+        let storage = cell_registry.get(storage_hostid).cloned().ok_or(error!("storage hostid not found"))?;
+        let actions = cell_registry.get(actions_hostid).cloned().ok_or(error!("actions hostid not found"))?;
         if !is_committed {
             self.output = CommittedState::new_empty();
         } else {
@@ -373,6 +387,53 @@ fn cell_serialize(cell: &Cell, hostid: usize) -> Result<Vec<u8>> {
 fn cell_register(registry: &mut Vec<Cell>, cell: &Cell) -> usize {
     registry.push(cell.clone());
     registry.len() - 1
+}
+
+fn make_cell_impl(mut env: FunctionEnvMut<WasmEnv>, ptr: u32, size: u32) -> Result<u32> {
+    let memory = env.data().memory();
+    let view = memory.view(&env);
+    let mut input = vec!(0; size as usize);
+    view.read(ptr as u64, &mut input)?;
+
+    let mut c = Cursor::new(&input);
+    let references_count = c.read_u8()?;
+    let mut references = vec!();
+    let registry = &mut env.data_mut().cell_registry;
+    for _ in 0..references_count {
+        let hostid = c.read_u32()? as usize;
+        let cell = registry.get(hostid).unwrap().clone();
+        references.push(cell); // TODO err
+    }
+
+    let data_size = c.read_u8()? as usize;
+    let data = c.read_bytestring(data_size)?;
+    let cell_type = CellType::from(c.read_u8()?);
+    let mask = c.read_u8()?;
+    let max_depth = c.read_u16()?;
+
+    let cell = Cell::with_cell_impl(
+        DataCell::with_max_depth(
+            references,
+            &data,
+            cell_type,
+            mask,
+            max_depth
+        )?
+    );
+
+    let registry = &mut env.data_mut().cell_registry;
+    let new_hostid = cell_register(registry, &cell);
+    let bytes = cell_serialize(&cell, new_hostid)?;
+    let size = u32::try_from(bytes.len())?;
+
+    let alloc = env.data().alloc.as_ref().unwrap().clone();
+    let offset = alloc.call(&mut env, size + 4)?;
+    let memory = env.data().memory();
+    let view = memory.view(&env);
+    view.write(offset as u64, &size.to_le_bytes())?;
+    view.write(offset as u64 + 4, &bytes)?;
+
+    Ok(offset)
 }
 
 const GAS_FACTOR: u64 = 666;
