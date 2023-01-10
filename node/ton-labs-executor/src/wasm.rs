@@ -11,7 +11,7 @@
  * limitations under the License.
  */
 
-use std::{convert::TryInto, sync::{Arc, Mutex}};
+use std::{convert::TryInto, sync::Arc};
 
 use ed25519::signature::Signature;
 use ed25519_dalek::{PublicKey, Verifier};
@@ -26,7 +26,7 @@ use ton_vm::{
 };
 use wasmer::{
     CompilerConfig, EngineBuilder, Function, FunctionEnv, FunctionEnvMut, Imports, imports, Instance,
-    Memory, Module, Store, TypedFunction, WasmPtr, wasmparser::Operator,
+    Memory, Module, Store, TypedFunction, wasmparser::Operator,
 };
 use wasmer_compiler_singlepass::Singlepass;
 use wasmer_middlewares::{
@@ -46,9 +46,6 @@ impl<'a> Cursor<'a> {
             bytes,
             pos: 0,
         }
-    }
-    fn read_bool(&mut self) -> Result<bool> {
-        self.read_u8().map(|v| v != 0)
     }
     fn read_u8(&mut self) -> Result<u8> {
         let bytes = &self.bytes[self.pos..self.pos + 1];
@@ -78,8 +75,11 @@ impl<'a> Cursor<'a> {
 struct WasmEnv {
     memory: Option<Memory>,
     alloc: Option<TypedFunction<u32, u32>>,
-    accepted: Arc<Mutex<bool>>,
+    accepted: bool,
     cell_registry: Vec<Cell>,
+    committed: bool,
+    storage: u32,
+    actions: u32,
 }
 
 impl WasmEnv {
@@ -131,8 +131,11 @@ impl WasmVM {
             WasmEnv {
                 memory: None,
                 alloc: None,
-                accepted: Arc::new(Mutex::new(false)),
+                accepted: false,
                 cell_registry: vec!(Cell::default()),
+                committed: false,
+                storage: 0,
+                actions: 0,
             }
         );
 
@@ -258,9 +261,17 @@ impl WasmVM {
         Ok(res)
     }
     fn make_imports(&mut self) -> Imports {
-        let accept = Function::new_typed_with_env(&mut self.store, &self.env, |env: FunctionEnvMut<WasmEnv>| {
+        let accept = Function::new_typed_with_env(&mut self.store, &self.env,
+            |mut env: FunctionEnvMut<WasmEnv>| {
             log::debug!(target: "executor", "ACCEPT");
-            *env.data().accepted.lock().unwrap() = true;
+            env.data_mut().accepted = true;
+        });
+        let commit = Function::new_typed_with_env(&mut self.store, &self.env,
+            |mut env: FunctionEnvMut<WasmEnv>, storage: u32, actions: u32| {
+            log::debug!(target: "executor", "COMMIT");
+            env.data_mut().committed = true;
+            env.data_mut().storage = storage;
+            env.data_mut().actions = actions;
         });
         let print = Function::new_typed(&mut self.store, |v: u32| {
             log::debug!(target: "executor", "PRINT {:08x}", v);
@@ -309,6 +320,7 @@ impl WasmVM {
         imports! {
             "env" => {
                 "accept" => accept,
+                "commit" => commit,
                 "print" => print,
                 "trace" => trace,
                 "chksignu" => chksignu,
@@ -317,26 +329,16 @@ impl WasmVM {
             }
         }
     }
-    fn read_output(&mut self, memory: &Memory, output_ptr: u32) -> Result<()> {
-        let view = memory.view(&self.store);
-
-        let new_data_ptr = WasmPtr::<u32>::new(output_ptr).deref(&view).read().unwrap();
-        let new_data_size = WasmPtr::<u32>::new(output_ptr + 4).deref(&view).read().unwrap();
-
-        let mut output = vec!(0x00; new_data_size as usize);
-        view.read(new_data_ptr as u64, &mut output)?;
-
-        let mut c = Cursor::new(&output);
-        self.exit_code = c.read_u32()? as i32;
-        let is_committed = c.read_bool()?;
-        let storage_hostid = c.read_u32()? as usize;
-        let actions_hostid = c.read_u32()? as usize;
-        let cell_registry = &self.env.as_ref(&self.store).cell_registry;
-        let storage = cell_registry.get(storage_hostid).cloned().ok_or(error!("storage hostid not found"))?;
-        let actions = cell_registry.get(actions_hostid).cloned().ok_or(error!("actions hostid not found"))?;
+    fn read_output(&mut self) -> Result<()> {
+        let is_committed = self.env.as_ref(&self.store).committed;
         if !is_committed {
             self.output = CommittedState::new_empty();
         } else {
+            let storage_hostid = self.env.as_ref(&self.store).storage as usize;
+            let actions_hostid = self.env.as_ref(&self.store).actions as usize;
+            let cell_registry = &self.env.as_ref(&self.store).cell_registry;
+            let storage = cell_registry.get(storage_hostid).cloned().ok_or(error!("storage hostid not found"))?;
+            let actions = cell_registry.get(actions_hostid).cloned().ok_or(error!("actions hostid not found"))?;
             self.output = CommittedState::with_params(
                 StackItem::Cell(storage),
                 StackItem::Cell(actions),
@@ -349,7 +351,7 @@ impl WasmVM {
 fn load_cell_ref_impl(mut env: FunctionEnvMut<WasmEnv>, hostid: u32, index: u32) -> Result<u32> {
     // Get child cell
     let registry = &mut env.data_mut().cell_registry;
-    let cell = registry.get(hostid as usize).unwrap(); // TODO err
+    let cell = registry.get(hostid as usize).ok_or(error!("target hostid not found"))?;
     let child = cell.reference(index as usize)?;
 
     // Register and serialize child cell
@@ -401,8 +403,8 @@ fn make_cell_impl(mut env: FunctionEnvMut<WasmEnv>, ptr: u32, size: u32) -> Resu
     let registry = &mut env.data_mut().cell_registry;
     for _ in 0..references_count {
         let hostid = c.read_u32()? as usize;
-        let cell = registry.get(hostid).unwrap().clone();
-        references.push(cell); // TODO err
+        let cell = registry.get(hostid).ok_or(error!("child hostid not found"))?.clone();
+        references.push(cell);
     }
 
     let data_size = c.read_u8()? as usize;
@@ -450,8 +452,8 @@ impl VM for WasmVM {
 
         // alloc(size: i32) -> *mut u8
         let alloc = instance.exports.get_typed_function::<u32, u32>(&self.store, "alloc")?;
-        // entry(output_ptr: *mut u8, input_ptr: *const u8, input_size: i32)
-        let entry = instance.exports.get_typed_function::<(u32, u32, u32), ()>(&self.store, "entry")?;
+        // entry(input_ptr: *const u8, input_size: i32) -> i32
+        let entry = instance.exports.get_typed_function::<(u32, u32), u32>(&self.store, "entry")?;
         // Entire guest memory
         let memory = instance.exports.get_memory("memory")?;
         self.env.as_mut(&mut self.store).memory = Some(memory.clone());
@@ -465,11 +467,6 @@ impl VM for WasmVM {
         // Write input data starting from the offset given by the input ptr
         let view = memory.view(&self.store);
         view.write(input_ptr as u64, &input)?;
-        // Allocate a structure of two 4-bytes fields:
-        //  - output data ptr
-        //  - output data size
-        set_remaining_points(&mut self.store, &instance, GAS_FOR_ALLOC);
-        let output_ptr = alloc.call(&mut self.store, 8)?;
 
         // Compute initial gas offering
         let remaining_gas = self.gas.get_gas_limit() + self.gas.get_gas_credit();
@@ -478,7 +475,7 @@ impl VM for WasmVM {
         set_remaining_points(&mut self.store, &instance, initial_limit);
 
         // Execute contract's entry function for the first time
-        let res = entry.call(&mut self.store, output_ptr, input_ptr, input.len() as u32);
+        let mut res = entry.call(&mut self.store, input_ptr, input.len() as u32);
         match get_remaining_points(&mut self.store, &instance) {
             MeteringPoints::Remaining(rem) => {
                 log::debug!(target: "executor", "points remaining {}", rem);
@@ -491,7 +488,7 @@ impl VM for WasmVM {
                 }
             }
             MeteringPoints::Exhausted => {
-                let accepted = *self.env.as_ref(&self.store).accepted.lock().unwrap();
+                let accepted = self.env.as_ref(&self.store).accepted;
                 if self.is_ext_msg && accepted {
                     // Let transaction executor know there was an accept
                     self.gas.new_gas_limit(i64::MAX);
@@ -502,7 +499,7 @@ impl VM for WasmVM {
                     set_remaining_points(&mut self.store, &instance, secondary_limit);
 
                     // Execute contract's entry point for the second time
-                    let res2 = entry.call(&mut self.store, output_ptr, input_ptr, input.len() as u32);
+                    res = entry.call(&mut self.store, input_ptr, input.len() as u32);
                     match get_remaining_points(&mut self.store, &instance) {
                         MeteringPoints::Remaining(rem) => {
                             log::debug!(target: "executor", "points remaining {}", rem);
@@ -512,24 +509,22 @@ impl VM for WasmVM {
                             return Result::Err(ExceptionCode::OutOfGas.into())
                         }
                     }
-                    if let Err(e) = res2 {
-                        log::debug!(target: "executor", "{}", e);
-                        return Result::Err(ExceptionCode::FatalError.into())
-                    }
                 } else {
                     return Result::Err(ExceptionCode::OutOfGas.into())
                 }
             }
         }
-        if let Err(e) = res {
-            log::debug!(target: "executor", "{}", e);
-            return Result::Err(ExceptionCode::FatalError.into())
+        match res {
+            Err(e) => {
+                log::debug!(target: "executor", "{}", e);
+                Err(ExceptionCode::FatalError.into())
+            }
+            Ok(exit_code) => {
+                self.read_output()?;
+                log::debug!(target: "executor", "wasm exit code: {}", self.exit_code);
+                Ok(exit_code as i32)
+            }
         }
-
-        self.read_output(memory, output_ptr)?;
-        log::debug!(target: "executor", "wasm exit code: {}", self.exit_code);
-
-        Ok(self.exit_code)
     }
     fn steps(&self) -> u32 {
         100000

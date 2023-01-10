@@ -447,6 +447,7 @@ pub trait TransactionExecutor {
         if let Some(init_code_hash) = result_acc.init_code_hash() {
             smc_info.set_init_code_hash(init_code_hash.clone());
         }
+        let now = std::time::Instant::now();
         let mut vm = VMSetup::with_capabilites(SliceData::load_cell(code)?, self.config().capabilites())
             .set_smart_contract_info(smc_info)
             .set_stack(stack)
@@ -455,6 +456,7 @@ pub trait TransactionExecutor {
             .set_gas(gas)
             .set_debug(params.debug)
             .create()?;
+        log::debug!(target: "executor", "elapsed vm create {}", now.elapsed().as_micros());
 
         if let Some(modifiers) = params.behavior_modifiers.clone() {
             vm.modify_behavior(modifiers);
@@ -466,7 +468,9 @@ pub trait TransactionExecutor {
             vm.set_trace_callback(Box::new(move |engine, info| trace_callback(engine, info)));
         }
 
+        let now = std::time::Instant::now();
         let result = vm.execute();
+        log::debug!(target: "executor", "elapsed vm exec   {}", now.elapsed().as_micros());
         log::trace!(target: "executor", "execute result: {:?}", result);
         let mut raw_exit_arg = None;
         match result {
