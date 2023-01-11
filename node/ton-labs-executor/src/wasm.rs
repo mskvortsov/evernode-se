@@ -152,7 +152,7 @@ impl WasmVM {
             env,
         })
     }
-    fn make_bytecode(code: SliceData) -> Result<Vec<u8>> {
+    fn _make_bytecode_dict(code: SliceData) -> Result<Vec<u8>> {
         let dict_cell = code.reference(0)?;
         let dict = HashmapE::with_hashmap(16, Some(dict_cell));
         let mut bytecode = vec!();
@@ -161,6 +161,19 @@ impl WasmVM {
             bytecode.append(&mut v.get_bytestring(0));
         }
         Ok(bytecode)
+    }
+    fn make_bytecode(code: SliceData) -> Result<Vec<u8>> {
+        let cell = code.reference(0)?;
+        let mut bytes = vec!();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(cell);
+        while let Some(c) = queue.pop_front() {
+            bytes.append(&mut Vec::from(c.data()));
+            for i in 0..c.references_count() {
+                queue.push_back(c.reference(i)?)
+            }
+        }
+        Ok(bytes)
     }
     fn serialize_hashmap(&mut self, h: HashmapE) -> Result<Vec<u8>> {
         let mut bytes = vec!();
